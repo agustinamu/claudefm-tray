@@ -16,7 +16,6 @@ log = logging.getLogger(__name__)
 class StreamInfo:
     title: str
     hls_url: str
-    viewers: int | None
     release_ts: int | None
 
 
@@ -34,30 +33,18 @@ def resolve_stream(url: str) -> StreamInfo:
             "-f", "bestaudio/worst",
             "--print", "%(title)s",
             "--print", "urls",
-            "--print", "%(concurrent_view_count)s",
             "--print", "%(release_timestamp)s",
         ],
         url=url,
     )
-    if len(parts) < 4:
+    if len(parts) < 3:
         raise RuntimeError("yt-dlp returned incomplete metadata")
-    title, hls, viewers, ts = parts[:4]
+    title, hls, ts = parts[:3]
     return StreamInfo(
         title=title,
         hls_url=hls,
-        viewers=None if viewers in ("", "NA") else int(viewers),
         release_ts=None if ts in ("", "NA") else int(ts),
     )
-
-
-def poll_viewers(url: str) -> int | None:
-    try:
-        parts = _run_ytdlp(["--print", "%(concurrent_view_count)s"], url=url, timeout=15)
-    except Exception as e:
-        log.warning("poll_viewers failed: %s", e)
-        return None
-    raw = parts[0] if parts else ""
-    return None if raw in ("", "NA") else int(raw)
 
 
 class MpvController:
@@ -66,20 +53,28 @@ class MpvController:
         self.proc: subprocess.Popen[bytes] | None = None
         self._lock = threading.Lock()
 
-    def start(self, hls_url: str, title: str) -> None:
+    def start(
+        self,
+        hls_url: str,
+        title: str,
+        volume: int = 100,
+        paused: bool = False,
+    ) -> None:
         if self.is_alive():
             return
         self.socket_path.unlink(missing_ok=True)
         cmd = [
             "mpv",
             "--no-video",
-            "--volume=100",
+            f"--volume={volume}",
             "--no-input-terminal",
             "--really-quiet",
             f"--input-ipc-server={self.socket_path}",
             f"--force-media-title={title}",
-            hls_url,
         ]
+        if paused:
+            cmd.append("--pause")
+        cmd.append(hls_url)
         log.info("starting mpv")
         self.proc = subprocess.Popen(
             cmd,
@@ -133,3 +128,16 @@ class MpvController:
     def is_paused(self) -> bool:
         r = self._send({"command": ["get_property", "pause"]})
         return bool(r and r.get("data"))
+
+    def get_volume(self) -> int | None:
+        r = self._send({"command": ["get_property", "volume"]})
+        if not r or r.get("data") is None:
+            return None
+        return int(round(float(r["data"])))
+
+    def add_volume(self, delta: int) -> None:
+        self._send({"command": ["add", "volume", delta]})
+
+    def set_volume(self, value: int) -> None:
+        value = max(0, min(130, value))
+        self._send({"command": ["set_property", "volume", value]})

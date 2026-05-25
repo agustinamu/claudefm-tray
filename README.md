@@ -1,21 +1,20 @@
 # claudefm-tray
 
-Indicador en la barra superior de GNOME para [claudeFM](https://github.com/sanhuaaan/claudefm) — escuchar la radio sin ocupar una terminal.
+Indicador en la barra superior de GNOME para escuchar la radio [claudeFM](https://github.com/sanhuaaan/claudefm) sin tener que dejar abierta una terminal.
 
-Muestra los viewers en directo y una mini sparkline al lado del icono. El menú expone el título del stream, el tiempo "on for X", un play/pausa y un refresh manual de viewers.
+| En la barra superior | Menú al hacer clic |
+|---|---|
+| ![icono](docs/tray-status.png) | ![menú](docs/tray-status-menu.png) |
 
-La URL del stream se lee de `~/.config/claudefm/url` (el mismo archivo que usa el `claudefm` original — basta con compartirlo o enlazarlo).
+## Qué hace
 
-## ¿Reutiliza claudefm?
+- Reproduce el stream HLS de YouTube en segundo plano vía `yt-dlp` + `mpv`.
+- Pinta un icono `♪` en la barra superior con el porcentaje de volumen al lado: `♪ 100%`.
+- Menú con: título del stream, "on for Xh", control de volumen (submenú radio 0/25/50/75/100/125), pausa/reanudar y salir.
+- **Scroll del ratón sobre el icono** → ±5% de volumen.
+- **Teclas multimedia del teclado** (Play/Pause, etc.) funcionan vía MPRIS si tienes instalado `mpv-mpris`.
+- **Auto-reconexión**: las URLs HLS de YouTube caducan cada ~6h; cuando mpv muere, la app la vuelve a resolver y relanza sola.
 
-**No.** Es una reimplementación independiente en Python. No invoca el binario `claudefm` ni comparte código. Lo único que comparte es el formato del archivo de configuración (la URL).
-
-Internamente:
-- llama a `yt-dlp` para resolver el HLS y los viewers,
-- arranca `mpv` con IPC propio,
-- pinta la sparkline.
-
-Si quieres en cambio un *wrapper* sobre el `claudefm` original con servicio systemd y soporte MPRIS para los controles multimedia, ese es el hermano [`claudefm-mpris`](../claudefm-mpris).
 
 ## Instalación
 
@@ -23,12 +22,23 @@ Si quieres en cambio un *wrapper* sobre el `claudefm` original con servicio syst
 ./install.sh
 ```
 
-Lo que hace el script:
+El script:
 
-1. `sudo apt install` de: `yt-dlp`, `mpv`, `python3-gi`, `gir1.2-ayatanaappindicator3-0.1`, `gnome-shell-extension-appindicator` (necesaria para que el icono aparezca en GNOME moderno).
-2. `uv venv --system-site-packages` para que el entorno virtual herede PyGObject del sistema (instalar PyGObject desde PyPI requeriría toolchain de C y los GIR typelibs — no compensa).
-3. `uv sync` para instalar el paquete en modo editable.
-4. Copia `claudefm-tray.desktop` a `~/.config/autostart/` para que arranque solo en cada sesión.
+1. `sudo apt install` de las dependencias del sistema (ver tabla más abajo).
+2. `uv venv --python /usr/bin/python3 --system-site-packages` — el venv hereda PyGObject del sistema porque instalarlo desde PyPI requiere toolchain de C y los GIR typelibs.
+3. `uv sync --inexact` para instalar el paquete en modo editable.
+4. Copia `claudefm-tray.desktop` a `~/.config/autostart/` para arranque en cada sesión.
+
+## Configuración
+
+Una sola pieza: escribe la URL de la radio en `~/.config/claudefm/url`:
+
+```bash
+mkdir -p ~/.config/claudefm
+echo "https://www.youtube.com/watch?v=YmQ7jRgf4f0" > ~/.config/claudefm/url
+```
+
+(es el ID del directo de Claude FM en mayo 2026; cambialo si rota).
 
 ## Ejecutar
 
@@ -38,12 +48,30 @@ uv run claudefm-tray
 .venv/bin/claudefm-tray
 ```
 
-Tras reiniciar sesión arranca automáticamente desde el autostart.
+Tras reiniciar sesión arranca solo desde el autostart.
 
 ## Parar
 
-Clic derecho en el icono → **Salir**. O directamente `pkill claudefm-tray`.
+Clic derecho en el icono → **Salir**. O `pkill claudefm-tray`.
+
+## Dependencias
+
+| Paquete apt | Para qué | Obligatorio |
+|---|---|---|
+| `yt-dlp` | Resolver la URL HLS de YouTube | sí |
+| `mpv` | Reproducir el HLS | sí |
+| `python3-gi` | Bindings Python ⇄ GLib | sí |
+| `gir1.2-gtk-3.0` | Typelibs GTK3 | sí |
+| `gir1.2-ayatanaappindicator3-0.1` | API del tray icon | sí |
+| `gnome-shell-extension-appindicator` | Render del icono en GNOME | sí |
+| `mpv-mpris` | Teclas multimedia del teclado | recomendado |
+
+`yt-dlp` debe ser **reciente** (las builds de apt suelen estar viejas y YouTube devuelve 403). Si pasa, instalar con `pipx install yt-dlp` o `uv tool install yt-dlp`.
 
 ## Créditos
 
-La idea, el formato del archivo de URL y la sparkline de viewers vienen de [sanhuaaan/claudefm](https://github.com/sanhuaaan/claudefm). Este proyecto es una reimplementación independiente como aplicación GTK de bandeja — sin fork, sin código compartido.
+La idea, el formato del archivo de URL y el statusline de viewers/sparkline en terminal vienen del proyecto original de [sanhuaaan/claudefm](https://github.com/sanhuaaan/claudefm). Este proyecto es una reimplementación independiente en forma de aplicación GTK de bandeja, sin fork ni código compartido.
+
+## Licencia
+
+MIT.

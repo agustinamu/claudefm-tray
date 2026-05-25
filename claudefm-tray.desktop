@@ -2,7 +2,7 @@
 Type=Application
 Name=claudeFM Tray
 Comment=Tray indicator for the claudeFM YouTube radio
-Exec=/home/agustin/workspace/casa/claudefm-tray/.venv/bin/claudefm-tray
+Exec=/home/agustin/workspace/casa/claudefm-tray/.venv/bin/claudefm-tray --paused
 Icon=multimedia-player
 Terminal=false
 X-GNOME-Autostart-enabled=true

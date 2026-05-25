@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections import deque
 
 import gi
 
@@ -11,25 +10,28 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
 
 from gi.repository import AyatanaAppIndicator3 as AppIndicator
-from gi.repository import GLib, Gtk
+from gi.repository import Gdk, GLib, Gtk
 
 from .config import read_url, runtime_socket
-from .sparkline import sparkline
-from .stream import MpvController, StreamInfo, poll_viewers, resolve_stream
+from .stream import MpvController, StreamInfo, resolve_stream
 
 log = logging.getLogger(__name__)
 
-POLL_SECONDS = 30
-UPTIME_REFRESH_SECONDS = 60
-BUFFER_SIZE = 8
+UPTIME_REFRESH_S = 30
+VOLUME_POLL_S = 2
+WATCHDOG_S = 30
+VOLUME_STEP = 5
+VOLUME_LEVELS = (0, 25, 50, 75, 100, 125)
 
 
 class TrayApp:
-    def __init__(self) -> None:
+    def __init__(self, start_paused: bool = False) -> None:
         self.url = read_url()
         self.info: StreamInfo | None = None
-        self.viewer_buf: deque[int] = deque(maxlen=BUFFER_SIZE)
         self.mpv = MpvController(runtime_socket())
+        self.volume: int = 100
+        self.start_paused = start_paused
+        self.volume_radio_items: dict[int, Gtk.RadioMenuItem] = {}
 
         self.indicator = AppIndicator.Indicator.new(
             "claudefm-tray",
@@ -38,13 +40,15 @@ class TrayApp:
         )
         self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
         self.indicator.set_title("claudeFM")
-        self.indicator.set_label("♪ …", "♪ 0000 ▁▂▃▄▅▆▇█")
+        self.indicator.set_label("♪ …", "♪ 100%")
+        self.indicator.connect("scroll-event", self._on_scroll)
 
         self._build_menu()
 
         threading.Thread(target=self._bootstrap, daemon=True).start()
-        GLib.timeout_add_seconds(UPTIME_REFRESH_SECONDS, self._refresh_label)
-        GLib.timeout_add_seconds(POLL_SECONDS, self._schedule_poll)
+        GLib.timeout_add_seconds(UPTIME_REFRESH_S, self._refresh_uptime)
+        GLib.timeout_add_seconds(VOLUME_POLL_S, self._sync_volume)
+        GLib.timeout_add_seconds(WATCHDOG_S, self._watchdog)
 
     def _build_menu(self) -> None:
         self.menu = Gtk.Menu()
@@ -59,13 +63,22 @@ class TrayApp:
 
         self.menu.append(Gtk.SeparatorMenuItem())
 
-        self.play_item = Gtk.MenuItem(label="Pausa")
-        self.play_item.connect("activate", self._on_toggle)
-        self.menu.append(self.play_item)
+        self.volume_item = Gtk.MenuItem(label="Volumen 100%")
+        volume_submenu = Gtk.Menu()
+        group: Gtk.RadioMenuItem | None = None
+        for level in VOLUME_LEVELS:
+            item = Gtk.RadioMenuItem.new_with_label_from_widget(group, f"{level}%")
+            if group is None:
+                group = item
+            item.connect("activate", self._on_volume_radio, level)
+            volume_submenu.append(item)
+            self.volume_radio_items[level] = item
+        self.volume_item.set_submenu(volume_submenu)
+        self.menu.append(self.volume_item)
 
-        refresh_item = Gtk.MenuItem(label="Recargar viewers")
-        refresh_item.connect("activate", lambda _w: self._schedule_poll())
-        self.menu.append(refresh_item)
+        self.play_item = Gtk.MenuItem(label="Pausa")
+        self.play_item.connect("activate", self._on_toggle_pause)
+        self.menu.append(self.play_item)
 
         self.menu.append(Gtk.SeparatorMenuItem())
 
@@ -84,10 +97,12 @@ class TrayApp:
             GLib.idle_add(self._set_error, str(e))
             return
         self.info = info
-        if info.viewers is not None:
-            self.viewer_buf.append(info.viewers)
-        self.mpv.start(info.hls_url, info.title)
+        self.mpv.start(
+            info.hls_url, info.title, volume=self.volume, paused=self.start_paused
+        )
+        GLib.idle_add(self._refresh_uptime)
         GLib.idle_add(self._refresh_label)
+        GLib.idle_add(self._sync_pause_label)
 
     def _set_error(self, msg: str) -> bool:
         self.title_item.set_label(f"error: {msg[:60]}")
@@ -95,52 +110,82 @@ class TrayApp:
         return False
 
     def _refresh_label(self) -> bool:
-        if not self.info:
-            return True
-        viewers = self.viewer_buf[-1] if self.viewer_buf else None
-        spark = sparkline(list(self.viewer_buf))
-        viewers_str = str(viewers) if viewers is not None else "?"
-        self.indicator.set_label(f"♪ {viewers_str} {spark}", "♪ 0000 ▁▂▃▄▅▆▇█")
-        self.title_item.set_label(self.info.title[:80])
-        self.uptime_item.set_label(self._uptime_text())
-        return True
+        self.indicator.set_label(f"♪ {self.volume}%", "♪ 100%")
+        self.volume_item.set_label(f"Volumen {self.volume}%")
+        if self.info:
+            self.title_item.set_label(self.info.title[:80])
+        self._sync_volume_radios()
+        return False
 
-    def _uptime_text(self) -> str:
+    def _sync_volume_radios(self) -> None:
+        # Light up the closest radio item without retriggering the signal.
+        closest = min(VOLUME_LEVELS, key=lambda lvl: abs(lvl - self.volume))
+        item = self.volume_radio_items.get(closest)
+        if item and not item.get_active():
+            item.handler_block_by_func(self._on_volume_radio)
+            item.set_active(True)
+            item.handler_unblock_by_func(self._on_volume_radio)
+
+    def _refresh_uptime(self) -> bool:
         if not self.info or self.info.release_ts is None:
-            return ""
+            return True
         secs = int(time.time()) - self.info.release_ts
         h, rem = divmod(secs, 3600)
         m = rem // 60
-        return f"on for {h}h {m:02d}m"
-
-    def _schedule_poll(self) -> bool:
-        threading.Thread(target=self._poll_once, daemon=True).start()
+        self.uptime_item.set_label(f"on for {h}h {m:02d}m")
         return True
 
-    def _poll_once(self) -> None:
-        v = poll_viewers(self.url)
-        if v is not None:
-            GLib.idle_add(self._on_viewers, v)
+    def _sync_volume(self) -> bool:
+        v = self.mpv.get_volume()
+        if v is not None and v != self.volume:
+            self.volume = v
+            self._refresh_label()
+        return True
 
-    def _on_viewers(self, v: int) -> bool:
-        self.viewer_buf.append(v)
+    def _change_volume(self, delta: int) -> None:
+        self.mpv.add_volume(delta)
+        # Optimistic UI update; _sync_volume will reconcile if needed.
+        self.volume = max(0, min(130, self.volume + delta))
         self._refresh_label()
+
+    def _on_scroll(self, _indicator, _steps, direction) -> None:
+        if direction == Gdk.ScrollDirection.UP:
+            self._change_volume(+VOLUME_STEP)
+        elif direction == Gdk.ScrollDirection.DOWN:
+            self._change_volume(-VOLUME_STEP)
+
+    def _on_volume_radio(self, item: Gtk.RadioMenuItem, level: int) -> None:
+        if not item.get_active():
+            return
+        self.volume = level
+        self.mpv.set_volume(level)
+        self.indicator.set_label(f"♪ {self.volume}%", "♪ 100%")
+        self.volume_item.set_label(f"Volumen {self.volume}%")
+
+    def _on_toggle_pause(self, _w: Gtk.MenuItem) -> None:
+        self.mpv.toggle_pause()
+        self._sync_pause_label()
+
+    def _sync_pause_label(self) -> bool:
+        self.play_item.set_label("Reanudar" if self.mpv.is_paused() else "Pausa")
         return False
 
-    def _on_toggle(self, _w: Gtk.MenuItem) -> None:
-        self.mpv.toggle_pause()
-        paused = self.mpv.is_paused()
-        self.play_item.set_label("Reanudar" if paused else "Pausa")
+    def _watchdog(self) -> bool:
+        # YouTube HLS URLs expire (~6h). If mpv died, resolve and restart.
+        if self.info and not self.mpv.is_alive():
+            log.info("mpv died — re-resolving stream")
+            threading.Thread(target=self._bootstrap, daemon=True).start()
+        return True
 
     def _on_quit(self, _w: Gtk.MenuItem) -> None:
         self.mpv.stop()
         Gtk.main_quit()
 
 
-def run() -> None:
+def run(start_paused: bool = False) -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    TrayApp()
+    TrayApp(start_paused=start_paused)
     Gtk.main()
