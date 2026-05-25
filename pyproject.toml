@@ -1,0 +1,21 @@
+[project]
+name = "claudefm-tray"
+version = "0.1.0"
+description = "GNOME tray indicator for the claudeFM YouTube radio (no terminal required)"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+claudefm-tray = "claudefm_tray.app:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+# PyGObject is provided by the system (python3-gi + gir1.2-ayatanaappindicator3-0.1).
+# We don't install it from PyPI because it needs the GIR typelibs and a C toolchain.
+package = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/claudefm_tray"]
