@@ -1,9 +1,12 @@
 [Desktop Entry]
 Type=Application
 Name=claudeFM Tray
+GenericName=Radio Player
 Comment=Tray indicator for the claudeFM YouTube radio
+Keywords=radio;claude;claudefm;youtube;music;player;
 Exec=/home/agustin/workspace/casa/claudefm-tray/.venv/bin/claudefm-tray --paused
 Icon=multimedia-player
 Terminal=false
+StartupNotify=false
 X-GNOME-Autostart-enabled=true
 Categories=AudioVideo;Audio;Player;

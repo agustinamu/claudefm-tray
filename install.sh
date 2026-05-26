@@ -38,6 +38,11 @@ echo "==> autostart entry"
 mkdir -p "$HOME/.config/autostart"
 cp -v claudefm-tray.desktop "$HOME/.config/autostart/"
 
+echo "==> application launcher (so it shows up in the Ubuntu app search)"
+mkdir -p "$HOME/.local/share/applications"
+cp -v claudefm-tray.desktop "$HOME/.local/share/applications/"
+update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
+
 cat <<EOF
 
 done.
