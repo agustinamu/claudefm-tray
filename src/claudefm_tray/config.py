@@ -18,6 +18,12 @@ def read_url() -> str:
     return p.read_text().strip()
 
 
+def write_url(url: str) -> None:
+    p = claudefm_url_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(url.strip() + "\n")
+
+
 def runtime_dir() -> Path:
     base = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/{os.getuid()}"
     p = Path(base)

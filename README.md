@@ -10,7 +10,7 @@ Indicador en la barra superior de GNOME para escuchar la radio [claudeFM](https:
 
 - Reproduce el stream HLS de YouTube en segundo plano vía `yt-dlp` + `mpv`.
 - Pinta un icono `♪` en la barra superior con el porcentaje de volumen al lado: `♪ 100%`.
-- Menú con: título del stream, "on for Xh", control de volumen (submenú radio 0/25/50/75/100/125), pausa/reanudar y salir.
+- Menú con: título del stream, "on for Xh", control de volumen (submenú radio 0/25/50/75/100/125), pausa/reanudar, **cambiar URL** y salir.
 - **Scroll del ratón sobre el icono** → ±5% de volumen.
 - **Teclas multimedia del teclado** (Play/Pause, etc.) funcionan vía MPRIS si tienes instalado `mpv-mpris`.
 - **Auto-reconexión**: las URLs HLS de YouTube caducan cada ~6h; cuando mpv muere, la app la vuelve a resolver y relanza sola.
@@ -39,6 +39,11 @@ echo "https://www.youtube.com/watch?v=YmQ7jRgf4f0" > ~/.config/claudefm/url
 ```
 
 (es el ID del directo de Claude FM en mayo 2026; cambialo si rota).
+
+Cuando el directo caduca (YouTube los marca como privados/finalizados), no hace
+falta editar el fichero a mano: usa **«Cambiar URL…»** en el menú del icono. Pega
+la nueva URL, se guarda en `~/.config/claudefm/url` y la app vuelve a resolver y
+reproducir al momento.
 
 ## Ejecutar
 

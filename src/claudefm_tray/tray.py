@@ -13,7 +13,7 @@ gi.require_version("AyatanaAppIndicator3", "0.1")
 from gi.repository import AyatanaAppIndicator3 as AppIndicator
 from gi.repository import Gdk, GLib, Gtk
 
-from .config import read_url, runtime_socket
+from .config import read_url, runtime_socket, write_url
 from .stream import MpvController, StreamInfo, resolve_stream
 
 log = logging.getLogger(__name__)
@@ -89,6 +89,10 @@ class TrayApp:
         self.play_item = Gtk.MenuItem(label="Pausa")
         self.play_item.connect("activate", self._on_toggle_pause)
         self.menu.append(self.play_item)
+
+        self.url_item = Gtk.MenuItem(label="Cambiar URL…")
+        self.url_item.connect("activate", self._on_change_url)
+        self.menu.append(self.url_item)
 
         self.menu.append(Gtk.SeparatorMenuItem())
 
@@ -204,6 +208,49 @@ class TrayApp:
     def _on_toggle_pause(self, _w: Gtk.MenuItem) -> None:
         self.mpv.toggle_pause()
         # The new pause state arrives via _on_mpv_pause; no sync IPC needed.
+
+    def _on_change_url(self, _w: Gtk.MenuItem) -> None:
+        dialog = Gtk.Dialog(title="Cambiar URL de claudeFM")
+        dialog.set_modal(True)
+        dialog.add_button("Cancelar", Gtk.ResponseType.CANCEL)
+        ok = dialog.add_button("Aceptar", Gtk.ResponseType.OK)
+        ok.get_style_context().add_class("suggested-action")
+        dialog.set_default_response(Gtk.ResponseType.OK)
+
+        box = dialog.get_content_area()
+        box.set_spacing(6)
+        box.set_border_width(12)
+        label = Gtk.Label(label="URL del directo de YouTube:")
+        label.set_xalign(0)
+        box.add(label)
+        entry = Gtk.Entry()
+        entry.set_text(self.url)
+        entry.set_width_chars(48)
+        entry.set_activates_default(True)
+        box.add(entry)
+        dialog.show_all()
+
+        response = dialog.run()
+        new_url = entry.get_text().strip()
+        dialog.destroy()
+
+        if response == Gtk.ResponseType.OK and new_url and new_url != self.url:
+            write_url(new_url)
+            self.url = new_url
+            log.info("URL changed — reloading stream")
+            self._reload_stream()
+
+    def _reload_stream(self) -> None:
+        # Tear down the current stream and resolve the new URL from scratch.
+        self.mpv.stop()
+        self.info = None
+        self.start_paused = False
+        self.paused = False
+        self.play_item.set_label("Pausa")
+        self.title_item.set_label("cargando…")
+        self.uptime_item.set_label("")
+        self.indicator.set_label("♪ …", "♪ 100%")
+        self._spawn_bootstrap()
 
     def _watchdog(self) -> bool:
         # YouTube HLS URLs expire (~6h). If mpv died, resolve and restart.
