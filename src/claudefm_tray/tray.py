@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import signal
 import threading
 import time
 
@@ -18,7 +19,6 @@ from .stream import MpvController, StreamInfo, resolve_stream
 log = logging.getLogger(__name__)
 
 UPTIME_REFRESH_S = 30
-VOLUME_POLL_S = 2
 WATCHDOG_S = 30
 VOLUME_STEP = 5
 VOLUME_LEVELS = (0, 25, 50, 75, 100, 125)
@@ -29,9 +29,14 @@ class TrayApp:
         self.url = read_url()
         self.info: StreamInfo | None = None
         self.mpv = MpvController(runtime_socket())
+        self.mpv.on_volume_change = self._on_mpv_volume
+        self.mpv.on_pause_change = self._on_mpv_pause
         self.volume: int = 100
+        self.paused: bool = start_paused
         self.start_paused = start_paused
         self.volume_radio_items: dict[int, Gtk.RadioMenuItem] = {}
+        self._bootstrap_lock = threading.Lock()
+        self._bootstrapping = False
 
         self.indicator = AppIndicator.Indicator.new(
             "claudefm-tray",
@@ -45,10 +50,15 @@ class TrayApp:
 
         self._build_menu()
 
-        threading.Thread(target=self._bootstrap, daemon=True).start()
+        self._spawn_bootstrap()
         GLib.timeout_add_seconds(UPTIME_REFRESH_S, self._refresh_uptime)
-        GLib.timeout_add_seconds(VOLUME_POLL_S, self._sync_volume)
         GLib.timeout_add_seconds(WATCHDOG_S, self._watchdog)
+
+        # Catch SIGTERM/SIGINT so we tear the indicator down cleanly —
+        # otherwise the shell keeps a phantom icon until it notices the
+        # DBus name dropped.
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, self._on_signal)
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, self._on_signal)
 
     def _build_menu(self) -> None:
         self.menu = Gtk.Menu()
@@ -89,6 +99,16 @@ class TrayApp:
         self.menu.show_all()
         self.indicator.set_menu(self.menu)
 
+    def _spawn_bootstrap(self) -> None:
+        # Coalesce concurrent bootstrap requests: yt-dlp can take 10s+ and the
+        # watchdog fires every 30s, so without this a slow resolve would
+        # stack threads competing for the same IPC socket.
+        with self._bootstrap_lock:
+            if self._bootstrapping:
+                return
+            self._bootstrapping = True
+        threading.Thread(target=self._bootstrap, daemon=True).start()
+
     def _bootstrap(self) -> None:
         try:
             info = resolve_stream(self.url)
@@ -96,13 +116,21 @@ class TrayApp:
             log.error("resolve failed: %s", e)
             GLib.idle_add(self._set_error, str(e))
             return
+        finally:
+            # Released before start() so a death during start can be picked up
+            # by the next watchdog tick.
+            with self._bootstrap_lock:
+                self._bootstrapping = False
         self.info = info
         self.mpv.start(
             info.hls_url, info.title, volume=self.volume, paused=self.start_paused
         )
-        GLib.idle_add(self._refresh_uptime)
+        GLib.idle_add(self._refresh_uptime_once)
         GLib.idle_add(self._refresh_label)
-        GLib.idle_add(self._sync_pause_label)
+
+    def _refresh_uptime_once(self) -> bool:
+        self._refresh_uptime()
+        return False
 
     def _set_error(self, msg: str) -> bool:
         self.title_item.set_label(f"error: {msg[:60]}")
@@ -135,16 +163,27 @@ class TrayApp:
         self.uptime_item.set_label(f"on for {h}h {m:02d}m")
         return True
 
-    def _sync_volume(self) -> bool:
-        v = self.mpv.get_volume()
-        if v is not None and v != self.volume:
+    def _on_mpv_volume(self, v: int) -> None:
+        # Called from the mpv reader thread — hop to the GTK main loop.
+        GLib.idle_add(self._apply_volume, v)
+
+    def _on_mpv_pause(self, paused: bool) -> None:
+        GLib.idle_add(self._apply_pause, paused)
+
+    def _apply_volume(self, v: int) -> bool:
+        if v != self.volume:
             self.volume = v
             self._refresh_label()
-        return True
+        return False
+
+    def _apply_pause(self, paused: bool) -> bool:
+        self.paused = paused
+        self.play_item.set_label("Reanudar" if paused else "Pausa")
+        return False
 
     def _change_volume(self, delta: int) -> None:
         self.mpv.add_volume(delta)
-        # Optimistic UI update; _sync_volume will reconcile if needed.
+        # Optimistic UI update; the property-change event will reconcile.
         self.volume = max(0, min(130, self.volume + delta))
         self._refresh_label()
 
@@ -164,20 +203,28 @@ class TrayApp:
 
     def _on_toggle_pause(self, _w: Gtk.MenuItem) -> None:
         self.mpv.toggle_pause()
-        self._sync_pause_label()
-
-    def _sync_pause_label(self) -> bool:
-        self.play_item.set_label("Reanudar" if self.mpv.is_paused() else "Pausa")
-        return False
+        # The new pause state arrives via _on_mpv_pause; no sync IPC needed.
 
     def _watchdog(self) -> bool:
         # YouTube HLS URLs expire (~6h). If mpv died, resolve and restart.
         if self.info and not self.mpv.is_alive():
             log.info("mpv died — re-resolving stream")
-            threading.Thread(target=self._bootstrap, daemon=True).start()
+            self._spawn_bootstrap()
         return True
 
     def _on_quit(self, _w: Gtk.MenuItem) -> None:
+        self._shutdown()
+
+    def _on_signal(self) -> bool:
+        log.info("signal received — shutting down")
+        self._shutdown()
+        return False
+
+    def _shutdown(self) -> None:
+        try:
+            self.indicator.set_status(AppIndicator.IndicatorStatus.PASSIVE)
+        except Exception as e:
+            log.warning("indicator passive failed: %s", e)
         self.mpv.stop()
         Gtk.main_quit()
 

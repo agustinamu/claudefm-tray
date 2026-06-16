@@ -18,7 +18,16 @@ def read_url() -> str:
     return p.read_text().strip()
 
 
-def runtime_socket() -> Path:
+def runtime_dir() -> Path:
     base = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/{os.getuid()}"
-    Path(base).mkdir(parents=True, exist_ok=True)
-    return Path(base) / "claudefm-tray.sock"
+    p = Path(base)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def runtime_socket() -> Path:
+    return runtime_dir() / "claudefm-tray.sock"
+
+
+def runtime_lock() -> Path:
+    return runtime_dir() / "claudefm-tray.lock"
