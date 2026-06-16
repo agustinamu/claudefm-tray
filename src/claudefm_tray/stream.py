@@ -7,58 +7,27 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
 
-@dataclass
-class StreamInfo:
-    title: str
-    hls_url: str
-    release_ts: int | None
-
-
-def _run_ytdlp(args: list[str], url: str, timeout: int = 30) -> list[str]:
-    cmd = ["yt-dlp", "--no-warnings", *args, url]
-    out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    if out.returncode != 0:
-        raise RuntimeError(f"yt-dlp failed: {out.stderr.strip() or out.stdout.strip()}")
-    return out.stdout.strip().split("\n")
-
-
-def resolve_stream(url: str) -> StreamInfo:
-    parts = _run_ytdlp(
-        [
-            "-f", "bestaudio/worst",
-            "--print", "%(title)s",
-            "--print", "urls",
-            "--print", "%(release_timestamp)s",
-        ],
-        url=url,
-    )
-    if len(parts) < 3:
-        raise RuntimeError("yt-dlp returned incomplete metadata")
-    title, hls, ts = parts[:3]
-    return StreamInfo(
-        title=title,
-        hls_url=hls,
-        release_ts=None if ts in ("", "NA") else int(ts),
-    )
-
-
 # observe_property IDs — kept stable so the reader can route events by id.
 _OBS_VOLUME = 1
 _OBS_PAUSE = 2
+_OBS_TITLE = 3
+_OBS_PLAYLIST_POS = 4
+_OBS_PLAYLIST_COUNT = 5
 
 
 class MpvController:
     """Drives mpv over its JSON IPC socket.
 
+    mpv resolves the URL itself through its yt-dlp hook, so a single video, a
+    playlist or a live stream all work — we just hand it the original URL.
     Keeps one long-lived socket and a reader thread that dispatches
     property-change events to user-supplied callbacks. There is no polling;
-    mpv pushes updates whenever volume/pause change (including the initial
+    mpv pushes updates whenever a property changes (including the initial
     value, emitted automatically when observe_property is registered).
     """
 
@@ -68,21 +37,31 @@ class MpvController:
         self._sock: socket.socket | None = None
         self._send_lock = threading.Lock()
         self._reader_thread: threading.Thread | None = None
+        self._playlist_pos = -1
+        self._playlist_count = 0
         # Callbacks invoked from the reader thread — wrap with GLib.idle_add
         # on the consumer side if you need to touch GTK.
         self.on_volume_change: Callable[[int], None] | None = None
         self.on_pause_change: Callable[[bool], None] | None = None
+        self.on_title_change: Callable[[str], None] | None = None
+        self.on_playlist_change: Callable[[int, int], None] | None = None
 
     def start(
         self,
-        hls_url: str,
-        title: str,
+        url: str,
         volume: int = 100,
         paused: bool = False,
-    ) -> None:
+    ) -> bool:
+        """Launch mpv on `url`. Returns True if the IPC socket came up.
+
+        Returns False if mpv exited before the socket appeared (e.g. an
+        invalid or private URL that yt-dlp could not resolve).
+        """
         if self.is_alive():
-            return
+            return True
         self._close_socket()
+        self._playlist_pos = -1
+        self._playlist_count = 0
         self.socket_path.unlink(missing_ok=True)
         cmd = [
             "mpv",
@@ -90,12 +69,15 @@ class MpvController:
             f"--volume={volume}",
             "--no-input-terminal",
             "--really-quiet",
+            "--loop-playlist=inf",
+            "--ytdl=yes",
+            "--ytdl-format=bestaudio/best",
+            "--script-opts=ytdl_hook-ytdl_path=yt-dlp",
             f"--input-ipc-server={self.socket_path}",
-            f"--force-media-title={title}",
         ]
         if paused:
             cmd.append("--pause")
-        cmd.append(hls_url)
+        cmd.append(url)
         log.info("starting mpv")
         self.proc = subprocess.Popen(
             cmd,
@@ -107,17 +89,24 @@ class MpvController:
         for _ in range(50):
             if self.socket_path.exists():
                 break
+            if self.proc.poll() is not None:
+                log.warning("mpv exited before IPC socket appeared")
+                return False
             time.sleep(0.1)
         else:
             log.warning("mpv IPC socket did not appear in 5s")
-            return
+            return False
         if not self._open_socket():
-            return
+            return False
         self._start_reader()
         # Subscribe to property changes. mpv emits the current value once at
         # registration, so we don't need a follow-up get_property.
         self._send({"command": ["observe_property", _OBS_VOLUME, "volume"]})
         self._send({"command": ["observe_property", _OBS_PAUSE, "pause"]})
+        self._send({"command": ["observe_property", _OBS_TITLE, "media-title"]})
+        self._send({"command": ["observe_property", _OBS_PLAYLIST_POS, "playlist-pos"]})
+        self._send({"command": ["observe_property", _OBS_PLAYLIST_COUNT, "playlist-count"]})
+        return True
 
     def stop(self) -> None:
         self._close_socket()
@@ -213,6 +202,25 @@ class MpvController:
                 self.on_pause_change(bool(data))
             except Exception as e:
                 log.warning("on_pause_change failed: %s", e)
+        elif obs_id == _OBS_TITLE and data and self.on_title_change:
+            try:
+                self.on_title_change(str(data))
+            except Exception as e:
+                log.warning("on_title_change failed: %s", e)
+        elif obs_id == _OBS_PLAYLIST_POS and isinstance(data, int):
+            self._playlist_pos = data
+            self._emit_playlist()
+        elif obs_id == _OBS_PLAYLIST_COUNT and isinstance(data, int):
+            self._playlist_count = data
+            self._emit_playlist()
+
+    def _emit_playlist(self) -> None:
+        if not self.on_playlist_change:
+            return
+        try:
+            self.on_playlist_change(self._playlist_pos, self._playlist_count)
+        except Exception as e:
+            log.warning("on_playlist_change failed: %s", e)
 
     def _send(self, payload: dict) -> None:
         sock = self._sock

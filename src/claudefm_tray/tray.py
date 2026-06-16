@@ -14,7 +14,7 @@ from gi.repository import AyatanaAppIndicator3 as AppIndicator
 from gi.repository import Gdk, GLib, Gtk
 
 from .config import read_url, runtime_socket, write_url
-from .stream import MpvController, StreamInfo, resolve_stream
+from .stream import MpvController
 
 log = logging.getLogger(__name__)
 
@@ -27,10 +27,15 @@ VOLUME_LEVELS = (0, 25, 50, 75, 100, 125)
 class TrayApp:
     def __init__(self, start_paused: bool = False) -> None:
         self.url = read_url()
-        self.info: StreamInfo | None = None
+        self.title: str = ""
+        self.playlist_pos: int = -1
+        self.playlist_count: int = 0
+        self.playback_start: float | None = None
         self.mpv = MpvController(runtime_socket())
         self.mpv.on_volume_change = self._on_mpv_volume
         self.mpv.on_pause_change = self._on_mpv_pause
+        self.mpv.on_title_change = self._on_mpv_title
+        self.mpv.on_playlist_change = self._on_mpv_playlist
         self.volume: int = 100
         self.paused: bool = start_paused
         self.start_paused = start_paused
@@ -115,20 +120,20 @@ class TrayApp:
 
     def _bootstrap(self) -> None:
         try:
-            info = resolve_stream(self.url)
+            ok = self.mpv.start(
+                self.url, volume=self.volume, paused=self.start_paused
+            )
         except Exception as e:
-            log.error("resolve failed: %s", e)
+            log.error("mpv start failed: %s", e)
             GLib.idle_add(self._set_error, str(e))
             return
         finally:
-            # Released before start() so a death during start can be picked up
-            # by the next watchdog tick.
             with self._bootstrap_lock:
                 self._bootstrapping = False
-        self.info = info
-        self.mpv.start(
-            info.hls_url, info.title, volume=self.volume, paused=self.start_paused
-        )
+        if not ok:
+            GLib.idle_add(self._set_error, "no se pudo reproducir (¿URL válida?)")
+            return
+        self.playback_start = time.time()
         GLib.idle_add(self._refresh_uptime_once)
         GLib.idle_add(self._refresh_label)
 
@@ -137,15 +142,17 @@ class TrayApp:
         return False
 
     def _set_error(self, msg: str) -> bool:
+        self.playback_start = None
         self.title_item.set_label(f"error: {msg[:60]}")
+        self.uptime_item.set_label("")
         self.indicator.set_label("✗", "✗")
         return False
 
     def _refresh_label(self) -> bool:
         self.indicator.set_label(f"♪ {self.volume}%", "♪ 100%")
         self.volume_item.set_label(f"Volumen {self.volume}%")
-        if self.info:
-            self.title_item.set_label(self.info.title[:80])
+        if self.title:
+            self.title_item.set_label(self.title[:80])
         self._sync_volume_radios()
         return False
 
@@ -159,12 +166,17 @@ class TrayApp:
             item.handler_unblock_by_func(self._on_volume_radio)
 
     def _refresh_uptime(self) -> bool:
-        if not self.info or self.info.release_ts is None:
+        if self.playback_start is None:
+            self.uptime_item.set_label("")
             return True
-        secs = int(time.time()) - self.info.release_ts
+        secs = int(time.time() - self.playback_start)
         h, rem = divmod(secs, 3600)
         m = rem // 60
-        self.uptime_item.set_label(f"on for {h}h {m:02d}m")
+        parts = []
+        if self.playlist_count > 1 and self.playlist_pos >= 0:
+            parts.append(f"pista {self.playlist_pos + 1}/{self.playlist_count}")
+        parts.append(f"sonando {h}h {m:02d}m")
+        self.uptime_item.set_label(" · ".join(parts))
         return True
 
     def _on_mpv_volume(self, v: int) -> None:
@@ -173,6 +185,23 @@ class TrayApp:
 
     def _on_mpv_pause(self, paused: bool) -> None:
         GLib.idle_add(self._apply_pause, paused)
+
+    def _on_mpv_title(self, title: str) -> None:
+        GLib.idle_add(self._apply_title, title)
+
+    def _on_mpv_playlist(self, pos: int, count: int) -> None:
+        GLib.idle_add(self._apply_playlist, pos, count)
+
+    def _apply_title(self, title: str) -> bool:
+        self.title = title
+        self.title_item.set_label(title[:80])
+        return False
+
+    def _apply_playlist(self, pos: int, count: int) -> bool:
+        self.playlist_pos = pos
+        self.playlist_count = count
+        self._refresh_uptime()
+        return False
 
     def _apply_volume(self, v: int) -> bool:
         if v != self.volume:
@@ -243,7 +272,10 @@ class TrayApp:
     def _reload_stream(self) -> None:
         # Tear down the current stream and resolve the new URL from scratch.
         self.mpv.stop()
-        self.info = None
+        self.title = ""
+        self.playlist_pos = -1
+        self.playlist_count = 0
+        self.playback_start = None
         self.start_paused = False
         self.paused = False
         self.play_item.set_label("Pausa")
@@ -253,9 +285,17 @@ class TrayApp:
         self._spawn_bootstrap()
 
     def _watchdog(self) -> bool:
-        # YouTube HLS URLs expire (~6h). If mpv died, resolve and restart.
-        if self.info and not self.mpv.is_alive():
-            log.info("mpv died — re-resolving stream")
+        # Two failure modes to tell apart:
+        #  - mpv dies seconds after start → bad/dead URL; don't spin re-trying.
+        #  - mpv dies after running fine → live HLS expired (~6h); re-resolve.
+        if self.playback_start is None or self.mpv.is_alive():
+            return True
+        ran = time.time() - self.playback_start
+        if ran < 60:
+            log.warning("mpv died %ds after start — giving up (¿URL válida?)", int(ran))
+            GLib.idle_add(self._set_error, "el stream no se pudo mantener")
+        else:
+            log.info("mpv died after %ds — re-resolving", int(ran))
             self._spawn_bootstrap()
         return True
 
